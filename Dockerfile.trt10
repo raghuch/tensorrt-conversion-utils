@@ -1,0 +1,170 @@
+# syntax=docker/dockerfile:1
+#
+# Single image for the A100 / L40 / L40S path: build the .plan here, then serve
+# it from this same image, so the TensorRT version that compiles the engine is
+# by construction the one that loads it.
+#
+#   nvcr.io/nvidia/tritonserver:25.02-py3
+#     -> TensorRT 10.8.0.43, CUDA 12.8.0.38, Ubuntu 24.04, Python 3.12
+#
+# Why 25.02 and not the newest Triton (26.05 / TensorRT 10.16.1.11):
+#   * Driver. 26.05 is a CUDA 13.2 image and CUDA 13 needs driver r580+. On a
+#     CUDA 12.4/12.6 box (r550/r560) it will not start. 25.02 is CUDA 12.8,
+#     which runs on those drivers via CUDA 12 minor-version compatibility, and
+#     TensorRT 10.8 supports CUDA 12.0 through 12.8 natively.
+#   * TensorRT 11.x is off limits regardless: it removes ILayer.precision,
+#     set_output_type() and output_type_is_set(), which converter.py's
+#     add_extra_fp32() uses to hold Conformer accuracy in FP16. Everything
+#     converter.py touches is still present in 10.x.
+#   * If you ever move to driver r580+, change both lines below to
+#     tritonserver:26.05-py3 and tensorrt-cu13==10.16.1.11.
+#
+# For a V100 (SM 7.0) use Dockerfile.v100 instead -- no Triton newer than 24.04
+# can serve a V100 at all.
+#
+# Build (context is the repository root, one level above this file):
+#   docker build -f pt2onnx2trt/Dockerfile.trt10 -t conformer-trt-ampere .
+#
+# IMPORTANT -- this image does not export ONNX from the .nemo model.
+# NeMo is not installed here at all: the `trt` and `fold` steps need only
+# TensorRT and polygraphy, and the `onnx` step has to happen once elsewhere on
+# a Python 3.10 box (nemo_toolkit 2.3.3 declares Python >=3.10 but NVIDIA only
+# tests 3.10, and this image is 3.12). The ONNX is device-independent:
+#
+#   # once, on any Python 3.10 box (see requirements-convert-v100.txt or
+#   # requirements-convert-tensorrt10.txt -- either provides NeMo)
+#   python3 nemo2onnx2trt.py all Conformer-CTC-BPE.nemo
+#
+#   # copy models_latest_conformer-ctc-bpe/conformer_onnx_folded/model.onnx here
+#   docker run --gpus all -it --rm -v "$PWD:/work" -w /work \
+#     conformer-trt-ampere \
+#     python3 pt2onnx2trt/nemo2onnx2trt.py trt Conformer-CTC-BPE.nemo
+#
+# Serve:
+#   docker run --gpus all -d --name asr \
+#     -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+#     --shm-size=1g \
+#     -v /path/to/model_repository:/models \
+#     conformer-trt-ampere
+
+FROM nvcr.io/nvidia/tritonserver:25.02-py3
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_PROGRESS_BAR=off \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# libsndfile1     -> soundfile, for wav I/O (02_nemofe2ts.ipynb,
+#                    conformer-client.py, speech_utils.py).
+# build-essential -> kenlm is published as an sdist only and compiles.
+# python3-dev     -> headers for that compile.
+# git             -> only if you install from a VCS URL.
+RUN printf '%s\n' \
+        '#clear APT::Update::Post-Invoke-Success;' \
+        '#clear APT::Update::Post-Invoke;' \
+        '#clear DPkg::Post-Invoke;' > /tmp/apt-build.conf \
+    && apt-get -c /tmp/apt-build.conf update \
+    && apt-get -c /tmp/apt-build.conf install -y --no-install-recommends \
+        libsndfile1 \
+        build-essential \
+        python3-dev \
+        git \
+    && rm -f /tmp/apt-build.conf \
+    && rm -rf /var/lib/apt/lists/*
+
+# TensorRT Python bindings + trtexec, pinned to the EXACT version this image
+# already ships (10.8.0.43) so the builder and the server cannot disagree.
+#
+# tensorrt-cu12, not the bare `tensorrt` metapackage: the metapackage changes
+# CUDA variant with the version (10.8 -> cu12, but 10.16 -> cu13), and a
+# CUDA 13 build will not run on a CUDA 12 driver. Being explicit also makes
+# the requirement legible in this file.
+#
+# The NVIDIA index is needed because these are placeholder packages that
+# fetch the real wheel from pypi.nvidia.com at install time.
+RUN pip3 install --upgrade pip \
+ && pip3 install --extra-index-url https://pypi.nvidia.com \
+        "tensorrt-cu12==10.8.0.43"
+
+# ONNX-side stack + the Triton client, resolved in ONE pip pass on purpose.
+# onnx 1.16.2 accepts a wide range of protobuf versions and would otherwise
+# pull the newest (7.x); the client file pins protobuf==4.24.4 (the exact
+# version NeMo 2.3.3 requires), so installing them separately would install 7.x
+# first and downgrade it afterwards. One pass lands on 4.24.4 directly.
+#
+# NeMo is deliberately absent: the engine build never imports it -- only the
+# `onnx` step does -- so `trt` and `fold` work here in full. See the header for
+# why the export stays on a 3.10 environment.
+#
+# polygraphy is pinned to the same version as the V100 file so a given ONNX
+# folds to the same graph on either box.
+#
+# numpy is intentionally NOT pinned here. Triton warns that "Numpy 2.x is not
+# currently supported for Python Backend models and may cause them to return
+# empty tensors", and pyctcdecode declares numpy<2.0.0; the image already
+# ships a 1.x. Force-downgrading numpy inside a Triton image risks breaking
+# its own compiled extensions. (The client file's numpy==1.26.4 is a no-op
+# here because the image already provides exactly that.)
+COPY pt2onnx2trt/requirements.txt /tmp/requirements/requirements.txt
+RUN pip3 install \
+        polygraphy==0.49.26 \
+        onnx==1.16.2 \
+        onnx-graphsurgeon==0.5.8 \
+        onnxruntime==1.18.1 \
+        pyyaml==6.0.2 \
+        -r /tmp/requirements/requirements.txt \
+ && rm -rf /tmp/requirements
+
+# The toolchain itself. The build context is the repository root, so the
+# package lands at /work/pt2onnx2trt with the three modules it imports from
+# the repository root beside it, which is the layout the scripts'
+# CONFORMERASR_REPO_ROOT default assumes.
+WORKDIR /work
+COPY pt2onnx2trt/ /work/pt2onnx2trt/
+
+# Decoders for the optional beam-search stage. All three are on PyPI and all
+# three have Python 3.12 support: riva-asrlib-decoder ships a cp312 wheel,
+# pyctcdecode is pure Python, kenlm compiles from sdist.
+RUN pip3 install \
+        pyctcdecode==0.5.0 \
+        kenlm==0.3.0 \
+        riva-asrlib-decoder==0.4.4
+
+# Build-time contract gate. The Triton image guarantees the TensorRT backend,
+# but the conversion script also needs the Python bindings, trtexec, and --
+# the part most likely to rot -- the exact TensorRT APIs converter.py calls.
+# TensorRT 11.x silently removes ILayer.precision / set_output_type() /
+# output_type_is_set(); rather than discover that three hours into an engine
+# build, assert the contract here.
+RUN python3 -c 'import shutil; \
+import tensorrt as trt; \
+import polygraphy; \
+print("tensorrt ", trt.__version__); \
+print("polygraphy", polygraphy.__version__); \
+major = int(trt.__version__.split(".")[0]); \
+assert major == 10, f"expected TensorRT 10.x, found {trt.__version__}"; \
+assert hasattr(trt, "MemoryPoolType") and hasattr(trt.MemoryPoolType, "WORKSPACE"); \
+assert hasattr(trt.IBuilderConfig, "set_memory_pool_limit"); \
+assert hasattr(trt, "ElementWiseOperation") and hasattr(trt.ElementWiseOperation, "POW"); \
+assert hasattr(trt, "LayerType") and hasattr(trt.LayerType, "ELEMENTWISE"); \
+assert all(hasattr(trt.ILayer, api) for api in ("precision", "set_output_type", "output_type_is_set")), "Required ILayer API missing (removed in TensorRT 11.x)"; \
+assert shutil.which("trtexec"), "trtexec not found on PATH"; \
+print("trtexec  ", shutil.which("trtexec")); \
+print("contract OK")' || { \
+        echo >&2 "ERROR: this image does not satisfy the conversion toolchain contract."; \
+        echo >&2 "  - if TensorRT is missing/too old, check the tensorrt-cu12 pin" >&2; \
+        echo >&2 "  - if an attribute below is missing, this TensorRT removed an API" >&2; \
+        echo >&2 "    that converter.py depends on (10.x is the ceiling; 11.x is not)." >&2; \
+        exit 1; \
+    }
+
+# 8000 HTTP, 8001 gRPC, 8002 metrics.
+EXPOSE 8000 8001 8002
+
+# Serving is the default; override the command to build engines instead
+# (see the examples in the header).
+CMD ["tritonserver", "--model-repository=/models"]

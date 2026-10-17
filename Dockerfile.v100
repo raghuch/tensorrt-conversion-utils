@@ -1,0 +1,149 @@
+# syntax=docker/dockerfile:1
+#
+# Single image for the V100 path: build the .plan here, then serve it from
+# this same image, so the TensorRT version that compiles the engine is by
+# construction the one that loads it.
+#
+#   nvcr.io/nvidia/tritonserver:24.04-py3
+#     -> TensorRT 8.6.3, CUDA 12.4, Ubuntu 22.04, Python 3.10
+#
+# Why 24.04 specifically, and why this is the last version that works on a
+# V100 (SM 7.0):
+#   * TensorRT 8.6.x is the last line that runs on Volta -- 10.0 deprecated
+#     it, 10.5 removed it, and current TensorRT requires SM 7.5+.
+#   * Triton 25.01+ is documented as "CUDA compute capability 7.5 and later",
+#     so it cannot serve a V100 at all.
+#   * 24.04 bundles TensorRT 8.6.3, and nvcr.io/nvidia/pytorch:24.04-py3
+#     bundles the same 8.6.3, so build-here/serve-there is a matched pair.
+#
+# For A100 / L40 / L40S change the base image to
+#   nvcr.io/nvidia/tritonserver:25.01-py3   (TensorRT 10.8.0.43)
+# and see requirements-convert-tensorrt10.txt.
+#
+# Build (context is the repository root, one level above this file):
+#   docker build -f pt2onnx2trt/Dockerfile.v100 -t conformer-trt-v100 .
+#
+# The whole conversion toolchain is baked in, so only the checkpoint and the
+# model repository need mounting:
+#
+#   # ONNX -> folded ONNX -> engine, straight into the model repository
+#   docker run --gpus all -it --rm \
+#     -v "$PWD:/work" -w /work \
+#     conformer-trt-v100 \
+#     python3 pt2onnx2trt/nemo2onnx2trt.py all Conformer-CTC-BPE.nemo \
+#       --engine-path models/conformer_trt/1/model.plan
+#
+#   # export the feature extractor and set the repository up
+#   docker run --gpus all -it --rm \
+#     -v "$PWD:/work" -w /work \
+#     conformer-trt-v100 bash -c '
+#       python3 pt2onnx2trt/nemo_fe2ts.py Conformer-CTC-BPE.nemo \
+#         --out models/feature-extractor/1/model.pt
+#       python3 pt2onnx2trt/setup_model_repository.py \
+#         --repo models --nemo-model Conformer-CTC-BPE.nemo'
+#
+# Serve:
+#   docker run --gpus all -d --name asr \
+#     -p 8000:8000 -p 8001:8001 -p 8002:8002 \
+#     --shm-size=1g \
+#     -v /path/to/models:/models \
+#     conformer-trt-v100
+
+FROM nvcr.io/nvidia/tritonserver:24.04-py3
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_PROGRESS_BAR=off \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# libsndfile1     -> soundfile, for wav I/O (02_nemofe2ts.ipynb,
+#                    conformer-client.py, speech_utils.py).
+# build-essential -> kenlm is published as an sdist only and compiles.
+# python3-dev     -> headers for that compile.
+# git             -> only if you install from a VCS URL.
+# The soundfile wheel bundles libsndfile, so libsndfile1-dev is not needed.
+RUN printf '%s\n' \
+        '#clear APT::Update::Post-Invoke-Success;' \
+        '#clear APT::Update::Post-Invoke;' \
+        '#clear DPkg::Post-Invoke;' > /tmp/apt-build.conf \
+    && apt-get -c /tmp/apt-build.conf update \
+    && apt-get -c /tmp/apt-build.conf install -y --no-install-recommends \
+        libsndfile1 \
+        build-essential \
+        python3-dev \
+        git \
+    && rm -f /tmp/apt-build.conf \
+    && rm -rf /var/lib/apt/lists/*
+
+# torch is needed only for the .nemo -> ONNX export step; the Triton image
+# ships no torch. 2.3.1 is what NeMo 2.3.3 is resolved against (it pulls
+# lightning<=2.4.0, which wants torch 2.3+), and the cu121 wheels cover
+# sm_70 through sm_90, so this one image serves V100 and A100 alike.
+# CUDA 12.1 wheels run fine against this image's CUDA 12.4 runtime.
+RUN pip3 install --upgrade pip \
+ && pip3 install --extra-index-url https://download.pytorch.org/whl/cu121 \
+        torch==2.3.1
+
+# Conversion + client stacks, straight from the pinned files so the
+# environment is reproducible and cannot drift from the docs.
+#
+# The V100 file deliberately contains NO tensorrt pin. This image already
+# provides 8.6.3; pip-installing a second TensorRT would shadow the image's
+# copy, and the resulting plan would then fail to load in this same server.
+# (8.6.3 is not on PyPI or pypi.nvidia.com at all, so there is nothing to pin
+# to anyway -- that is why 8.6.3 is the version chosen here.)
+#
+# numpy is intentionally NOT pinned. The image ships a numpy 1.x, which is a
+# hard requirement: Triton warns that "Numpy 2.x is not currently supported for
+# Python Backend models and may cause them to return empty tensors", and
+# pyctcdecode also declares numpy<2.0.0. Force-downgrading a numpy inside a
+# Triton image risks breaking its own compiled extensions. The pinned value
+# for non-container venvs is 1.26.4 in the requirements files.
+COPY pt2onnx2trt/requirements-convert-v100.txt pt2onnx2trt/requirements.txt /tmp/requirements/
+RUN pip3 install \
+        -r /tmp/requirements/requirements-convert-v100.txt \
+        -r /tmp/requirements/requirements.txt \
+ && rm -rf /tmp/requirements
+
+# Decoders for the optional beam-search stage of the model repository.
+# Kept in their own layer so you can drop this if you only run the greedy
+# (tensorrt_plan) path. All three are on PyPI: riva-asrlib-decoder ships a
+# cp310 wheel, pyctcdecode is pure Python, kenlm compiles from sdist.
+RUN pip3 install \
+        pyctcdecode==0.5.0 \
+        kenlm==0.3.0 \
+        riva-asrlib-decoder==0.4.4
+
+# The toolchain itself. The build context is the repository root, so the
+# package lands at /work/pt2onnx2trt and the three modules it imports from
+# the repository root sit beside it -- which is exactly the layout the
+# scripts' CONFORMERASR_REPO_ROOT default assumes.
+WORKDIR /work
+COPY pt2onnx2trt/ /work/pt2onnx2trt/
+
+COPY --from=nvcr.io/nvidia/pytorch:24.04-py3 \
+    /usr/local/lib/python3.10/dist-packages/tensorrt/ \
+    /usr/local/lib/python3.10/dist-packages/tensorrt/
+
+RUN python3 -c 'import tensorrt as trt; \
+import polygraphy; \
+import nemo.collections.asr; \
+print("tensorrt ", trt.__version__); \
+print("polygraphy", polygraphy.__version__); \
+assert trt.__version__ == "8.6.3", f"expected 8.6.3, found {trt.__version__}"' || { \
+        echo >&2 "ERROR: this image is missing part of the TensorRT build toolchain."; \
+        echo >&2 "Build the engine in nvcr.io/nvidia/pytorch:24.04-py3 instead -- it" >&2; \
+        echo >&2 "carries the same TensorRT 8.6.3 -- and serve it with this image." >&2; \
+        exit 1; \
+    }
+
+# 8000 HTTP, 8001 gRPC, 8002 metrics.
+EXPOSE 8000 8001 8002
+
+# Serving is the default; override the command to build engines instead
+# (see the examples in the header).
+CMD ["tritonserver", "--model-repository=/models"]

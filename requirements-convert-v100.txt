@@ -1,0 +1,209 @@
+# Conversion pipeline for nemo2onnx2trt.py on a V100 (SM 7.0):
+#   .nemo -> ONNX -> folded ONNX -> TensorRT engine
+#
+# V100 ONLY. For A100 / L40 / L40S use requirements-convert-tensorrt10.txt.
+#
+# PRIMARY PATH -- use the container, which already has the right TensorRT:
+#
+#   docker run -it --gpus all -v $PWD:/workspace -w /workspace \
+#       nvcr.io/nvidia/pytorch:24.04-py3
+#   pip install -r requirements-convert-v100.txt
+#
+# That container is Ubuntu 22.04 / Python 3.10 / CUDA 12.4.1 / torch 2.3.0a0 /
+# TensorRT 8.6.3, so torch and TensorRT need no pin from pip and must NOT be
+# pip-installed over the top (see "TensorRT version" below).
+#
+# PIP-ONLY FALLBACK -- no container available. Install torch first, because it
+# needs a CUDA index:
+#
+#   pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
+#       torch==2.2.2
+#   pip install -r requirements-convert-v100.txt
+#
+#
+# TensorRT version: 8.6.3, and this is not negotiable
+# ----------------------------------------------------
+# V100 is compute capability 7.0. TensorRT 8.6.x is the LAST line that runs
+# on it: 10.0 deprecated Volta, 10.5 removed it, and current TensorRT requires
+# SM 7.5+. There is no GA TensorRT 9 (9.x only ever shipped as dev pre-releases).
+#
+#   V100        -> TensorRT 8.6.3 -> nvcr.io/nvidia/pytorch:24.04-py3
+#   A100/L40(S) -> TensorRT 10.8.0.43 -> requirements-convert-tensorrt10.txt
+#
+# 8.6.3 is container-only, and that is the whole reason it is not a pip pin
+# here. Checked directly against the indexes: PyPI publishes only 8.6.0,
+# 8.6.1 and 8.6.1.post1, and pypi.nvidia.com publishes only 8.6.0/8.6.1.
+# There is no 8.6.3 wheel anywhere on pip. NVIDIA ships 8.6.3 inside NGC
+# images -- both nvcr.io/nvidia/pytorch:24.04-py3 (build) and
+# nvcr.io/nvidia/tritonserver:24.04 (serve) bundle it, which is exactly the
+# matched pair you want.
+#
+# So on the container path this file installs NO TensorRT. That is deliberate,
+# not an omission: pip-installing a second TensorRT into the image would
+# shadow the container's 8.6.3, and the plan you build would then fail to
+# deserialize in the 24.04 Triton server.
+#
+# On the pip-only fallback there is no 8.6.3 to get, so the closest available
+# is 8.6.1 (GA packaging version 8.6.1.6) -- and then you must serve with
+# Triton 24.01, which bundles 8.6.1.6. Mixing an 8.6.1 plan with a 24.04
+# (8.6.3) server fails, unless the plan is built with version compatibility.
+#
+# On CUDA 12.4 / 12.6 drivers
+# ---------------------------
+# TensorRT 8.6.x was built against CUDA 12.0/12.1 and no 12.4/12.6 build of
+# it exists -- nor of anything else that still supports V100. That is fine:
+# the wheels and containers bundle their own CUDA runtime, so what must line
+# up is the DRIVER, not the local toolkit.
+#
+#   CUDA 12.4 needs driver >= 550, CUDA 12.6 needs driver >= 560,
+#   TensorRT 8.6.x's CUDA 12.0 runtime needs driver >= 525,
+#   NGC 24.04 asks for driver >= 545.
+#
+# A 12.4/12.6 driver satisfies all of them, so one environment works on the
+# V100 regardless of which of those toolkits the box carries. TensorRT's own
+# kernels are simply compiled against 12.0/12.1.
+#
+#
+# Serving container: match the TensorRT version
+# ---------------------------------------------
+# A plan only deserializes under a matching TensorRT runtime. Pick the Triton
+# container whose bundled TensorRT matches the engine you built:
+#
+#   build in pytorch:24.04-py3 (8.6.3) -> serve with tritonserver:24.04 (8.6.3)
+#   build with pip  tensorrt 8.6.1     -> serve with tritonserver:24.01 (8.6.1.6)
+#
+# Note also that Triton 25.01 and newer are documented as "CUDA compute
+# capability 7.5 and later", so they cannot serve V100 at all. 24.01-24.04
+# is the V100 ceiling.
+#
+#
+# How the two files fit together
+# ------------------------------
+# Both files pin the ONNX-side packages (onnx, onnxruntime, polygraphy,
+# sentencepiece, numpy) identically so the folded ONNX is the same graph on
+# every box. They deliberately differ on TensorRT, and on torch, because the
+# two boxes run different CUDA stacks.
+#
+# You do not have to keep torch aligned. TensorRT engines must be built on the
+# GPU they will run on, so the ONNX cannot be produced on every box anyway --
+# produce it once and copy it:
+#
+#   # once, on any box (this is the only step that needs NeMo + torch)
+#   python3 nemo2onnx2trt.py all Conformer-CTC-BPE.nemo
+#
+#   # then on each GPU box: engine only. Needs TensorRT + polygraphy, NOT NeMo.
+#   python3 nemo2onnx2trt.py trt Conformer-CTC-BPE.nemo
+#
+# Because the engine step never imports NeMo, the per-GPU build box only
+# needs TensorRT, polygraphy, onnx and onnxruntime from this file.
+
+# --- PyTorch -----------------------------------------------------------------
+# Not pinned here: nvcr.io/nvidia/pytorch:24.04-py3 already provides torch
+# 2.3.0a0 built against CUDA 12.4.1, and NeMo 2.3.3 leaves `torch` unpinned so
+# it uses exactly that. The container's torch also covers sm_70, so V100 and
+# A100 builds come from the same environment.
+#
+# On the pip-only fallback, install torch yourself from the CUDA index before
+# this file (it is a separate index, so it cannot be a line here):
+#   pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
+#       torch==2.3.1
+# 2.3.1 is what the set below was resolved against, and it is in NeMo 2.3.3's
+# supported range (it pulls lightning<=2.4.0, which wants torch 2.3+).
+
+# --- Config parsing ----------------------------------------------------------
+# Both nemo_fe2ts.py and setup_model_repository.py read model_config.yaml out
+# of the .nemo tarball. NGC containers ship PyYAML, but a plain venv does not,
+# so it is pinned here rather than assumed.
+pyyaml==6.0.2
+
+# --- TensorRT ----------------------------------------------------------------
+# Not pinned, and that is deliberate.
+#
+# On the container path there is nothing to install: pytorch:24.04-py3 already
+# has TensorRT 8.6.3, which is the V100-capable version you want and the one
+# tritonserver:24.04 will load. Installing a second TensorRT from pip would
+# shadow it and your plan would stop deserializing on the server.
+#
+# If you are on the pip-only fallback, uncomment the line below. It is the
+# closest pip-installable member of the 8.6 line (GA packaging version
+# 8.6.1.6) and it still requires Triton 24.01 on the serving side, not 24.04.
+# There is no 8.6.3 on pip to switch to -- see the header.
+#
+# Do NOT fall back to a 10.x version under any circumstance: it cannot build
+# for V100 at all.
+# tensorrt==8.6.1
+
+# --- Polygraphy --------------------------------------------------------------
+# 0.49.x is the line that supports TensorRT 8.6 (it still passes
+# explicit_batch=True to the builder on TRT < 10) and spans 8.6 through 11.x.
+# 0.50+ tracks TensorRT 10. Provides both the `polygraphy surgeon sanitize
+# --fold-constants` CLI and the polygraphy.backend.trt API converter.py uses.
+polygraphy==0.49.26
+
+# --- NeMo --------------------------------------------------------------------
+# 2.3.3, because that is what wrote the checkpoint: model_config.yaml inside
+# the .nemo records `nemo_version: 2.3.0rc0`. Matching the version that saved
+# the model is the safest way to restore it, and it keeps the API this
+# pipeline uses: nemo.collections.asr.models.ASRModel.restore_from plus
+# Exportable.export(onnx_opset_version=...) and
+# nemo.collections.asr.models.ctc_bpe_models.EncDecCTCModelBPE, all still
+# present in 2.3.3. NeMo 2.x also requires Python >= 3.10 with no upper bound.
+# 2.3.3 rather than 2.3.0 because 2.3.3 is the last 2.3.x patch.
+nemo_toolkit[asr]==2.3.3
+
+# --- ONNX --------------------------------------------------------------------
+# 1.16.2: opset 18 (what the model is exported at) needs onnx >= 1.13, and
+# NeMo 2.3.3 asks only for onnx>=1.7.0.
+onnx==1.16.2
+onnx-graphsurgeon==0.5.8
+
+# --- ONNX Runtime ------------------------------------------------------------
+# CPU build on purpose. polygraphy's --fold-constants runs an onnxruntime
+# graph pass, and constant folding is CPU work; the GPU build would only add a
+# cuDNN/CUDA version coupling that can break the install for no gain.
+onnxruntime==1.18.1
+
+# --- Tokenizer ---------------------------------------------------------------
+# Required to deserialize this model's SentencePieceTokenizer at
+# restore_from() time. Without it, loading the .nemo fails. The [asr] extra
+# only asks for sentencepiece<1.0.0, so pin the version explicitly.
+sentencepiece==0.2.0
+# NeMo 2.3.3's [asr] extra constrains this to >=4.51.0,<=4.52.0, so it is
+# pinned rather than merely floated. 4.52.0 itself is yanked on PyPI, so take
+# 4.51.3, the newest release in the range that is not.
+transformers==4.51.3
+
+# --- Numerics ----------------------------------------------------------------
+# numpy 2 breaks the numba/librosa stack: NeMo 2.3.3 declares numpy<2.0.0 and
+# pins numba==0.61.0. This also satisfies Triton, which warns that numpy 2.x
+# breaks python_backend models.
+numpy==1.26.4
+# NeMo 2.3.3 pins protobuf==4.24.4 exactly, so this must match. It is also
+# inside tritonclient 2.51.0's protobuf<5,>=3.5.0 range, which is why that
+# version is the one pinned in requirements.txt.
+protobuf==4.24.4
+
+# ---
+# Sanity check after installing (inside the container):
+#   python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#   python -c "import tensorrt as trt; print(trt.__version__)"        # must print 8.6.3
+#   python -c "import polygraphy; print(polygraphy.__version__)"      # 0.49.26
+#   python -c "import nemo; print(nemo.__version__)"                 # 2.3.3
+#   python -c "import nemo.collections.asr"                          # imports cleanly
+#   python nemo2onnx2trt.py gpus                                     # must show sm_70
+#
+# Confirm the checkpoint restores under this NeMo, not just that it imports:
+#   python nemo2onnx2trt.py gpus && python nemo_fe2ts.py model.nemo --out /tmp/fe.pt
+#
+# If `import nemo.collections.asr` fails inside pytorch:24.04-py3, use the
+# pip-only fallback in the header, which resolves the whole set on torch 2.3.1.
+# (torch 2.2.0a0, TensorRT 8.6.1.6) and serve with Triton 24.01.
+#
+# The pip pins above were resolved together for Python 3.10 / linux x86_64
+# with torch 2.3.1: 199 packages, no conflicts, no yanked pins. TensorRT is
+# unpinned because 8.6.3 comes from the container. This is a resolution check,
+# not an executed install, and the binding constraint is still the V100, so
+# validate there first.
+#
+# The same NeMo/ONNX-side pins are in requirements-convert-tensorrt10.txt, so
+# both GPU classes produce a bit-identical ONNX; only TensorRT differs.

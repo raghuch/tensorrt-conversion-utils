@@ -1,0 +1,102 @@
+CONFORMER CONVERSION AND TRITON REPOSITORY
+
+Run the conversion commands INSIDE the GPU-enabled container.
+Replace MODEL, GPU_PLAN, and the other paths before running.
+WORKDIR must contain the pt2onnx2trt directory. Store artifacts and the
+repository on mounted volumes so they survive container removal.
+
+1. Set paths
+
+cd /work
+MODEL=/work/YOUR_MODEL.nemo
+ARTIFACTS=/work/artifacts/ai4bharat/hi-conformer
+REPO=/work/models/hi-conformer
+
+2. Check conversion dependencies
+
+python3 -c 'import tensorrt, numpy, onnxruntime, onnx_graphsurgeon; print("TensorRT:", tensorrt.__version__); print("NumPy:", numpy.__version__); print("ONNX Runtime:", onnxruntime.__version__)'
+
+Expected for the V100 image: TensorRT 8.6.3, NumPy 1.26.4,
+ONNX Runtime 1.18.1. If GraphSurgeon is absent or NumPy is incompatible:
+
+python3 -m pip install "numpy==1.26.4" "onnx==1.16.2" "onnx-graphsurgeon==0.5.8"
+
+3. Export ONNX, fold constants, and build TensorRT
+
+python3 pt2onnx2trt/nemo2onnx2trt.py all "$MODEL" \
+  --artifacts-dir "$ARTIFACTS" --workspace-size 3096
+
+3096 is the build workspace in MiB, not a total GPU-memory limit.
+Defaults: FP16, batch min/opt/max 1/4/64, feature frames 1/1001/3001.
+3001 frames covers 30-second audio with the current 10 ms frontend hop.
+If workspace-related build errors occur, retry the TRT step with 4096.
+
+To resume after ONNX export without re-exporting the checkpoint:
+
+python3 pt2onnx2trt/nemo2onnx2trt.py fold --artifacts-dir "$ARTIFACTS" && \
+python3 pt2onnx2trt/nemo2onnx2trt.py trt \
+  --artifacts-dir "$ARTIFACTS" --workspace-size 3096
+
+4. Copy the appropriate GPU-tagged plan into the repository
+
+ls "$ARTIFACTS/conformer_trt/"
+GPU_PLAN="$ARTIFACTS/conformer_trt/model_YOUR_GPU.plan"
+mkdir -p "$REPO/conformer_trt/1"
+cp "$GPU_PLAN" "$REPO/conformer_trt/1/model.plan"
+
+5. Export the feature extractor
+
+python3 pt2onnx2trt/nemo_fe2ts.py "$MODEL" \
+  --out "$REPO/feature-extractor/1/model.pt"
+
+6. Generate configs, vocabulary, Python decoder, and ensemble
+
+Choose ONE of the following commands. Re-running replaces decoder configs.
+Use max-batch 64 only when the engine profile supports batch 64.
+
+Greedy without LM:
+
+python3 pt2onnx2trt/setup_model_repository.py \
+  --repo "$REPO" --nemo-model "$MODEL" --max-batch 64 --decoder greedy
+
+PyCTCDecode beam without LM:
+
+python3 pt2onnx2trt/setup_model_repository.py \
+  --repo "$REPO" --nemo-model "$MODEL" --max-batch 64 --decoder beam
+
+PyCTCDecode beam with LM:
+
+python3 pt2onnx2trt/setup_model_repository.py \
+  --repo "$REPO" --nemo-model "$MODEL" --max-batch 64 --decoder beam \
+  --kenlm-model /models/lm/YOUR_LM.bin
+
+The LM path must exist INSIDE the serving container. Setup does not copy it.
+OpenSeq2Seq is NOT a generator option. Reusing an existing OpenSeq2Seq model
+requires adapting its config and tensor contracts; installation alone does
+not switch the generated decoder. Do not overwrite that model with setup.
+
+7. Start Triton inside the container
+
+tritonserver --model-repository="$REPO"
+
+Run the client in another shell/environment with access to the server:
+
+python3 pt2onnx2trt/triton_client.py --audio /path/to/test.wav \
+  --url localhost:8001 --model conformer_trt_ensemble
+
+Audio must be 16 kHz for the current frontend. Check model readiness and
+transcripts against NeMo; file creation alone does not establish accuracy.
+Serve the plan with matching TensorRT and the GPU it was built for.
+
+8. Save installed container dependencies (run on the DOCKER HOST)
+
+Wait for conversion to finish before committing; commit pauses the container.
+Replace YOUR_CONTAINER with the container where dependencies were installed.
+
+docker commit YOUR_CONTAINER triton-trt-v8:24.04-fixed
+docker run --rm --entrypoint python3 triton-trt-v8:24.04-fixed -c \
+  'import ctc_decoders; import pyctcdecode; import riva.asrlib.decoder; import numpy; import onnxruntime; import onnx_graphsurgeon; import tensorrt; print("All imports OK"); print("NumPy:", numpy.__version__); print("TensorRT:", tensorrt.__version__)'
+docker save -o triton-trt-v8-24.04-fixed.tar triton-trt-v8:24.04-fixed
+
+Mounted checkpoints, plans, repositories, and LM files are NOT included in
+docker commit/save. Preserve them separately and mount them when serving.

@@ -1,0 +1,74 @@
+# Client-side environment for the Triton tests:
+#   05_triton_client_ensemble*.ipynb, conformer-client.py, speech_utils.py
+#
+# This is a different environment from the conversion pipeline
+# (requirements-convert-v100.txt / requirements-convert-tensorrt10.txt).
+# Nothing here needs NeMo, TensorRT or a GPU: this stack just talks gRPC to a
+# running Triton server and reads/writes wav files.
+#
+#   pip install -r requirements.txt
+#
+# Keeping it separate from the conversion env is not a preference, it is
+# forced: tritonclient >= 2.52 requires protobuf >= 5.26.1, while NeMo 2.3.3
+# pins protobuf == 4.24.4 exactly. Those cannot be reconciled in one
+# environment. tritonclient 2.51.0 is pinned below precisely because it is the
+# newest release whose protobuf<5,>=3.5.0 range contains 4.24.4, so this file
+# and the conversion env agree on one protobuf version.
+#
+# Verified against the imports actually present in this repo
+# (tritonclient.grpc, soundfile, numpy): 11 packages, no conflicts, and
+# resolved together with the conversion env's full pin set.
+
+# --- Triton client -----------------------------------------------------------
+# [grpc] only, not [all]. Every consumer here does
+# `import tritonclient.grpc as grpc_client` and nothing else. The [all] extra
+# additionally drags in aiohttp, geventhttpclient, greenlet, cuda-python and
+# perf-analyzer -- 31 packages instead of 11, two of them native binaries this
+# project never touches. If you ever switch the client to the HTTP endpoint,
+# change this to tritonclient[grpc,http]; that is the only reason to widen it.
+#
+# 2.51.0 is the newest tritonclient whose grpc extra still accepts protobuf<5,
+# which is what lets it share protobuf 3.x with the conversion env. From
+# 2.52.0 it needs protobuf>=5.26.1; from 2.67.0, protobuf>=6.30.0; and 2.72.0
+# additionally requires Python >= 3.12, which this py3.10 environment is not.
+# The client version does not have to match the server version -- gRPC is
+# stable across these, and an older client talks to a newer Triton fine.
+tritonclient[grpc]==2.51.0
+
+# --- Audio I/O ---------------------------------------------------------------
+# Used by 02_nemofe2ts.ipynb, the 05_* notebooks, conformer-client.py and
+# speech_utils.py for sf.read / sf.write. This was previously unpinned, which
+# is how two machines end up disagreeing about wav handling.
+# Needs libsndfile; if the import fails, `apt-get install -y libsndfile1`.
+soundfile==0.13.1
+
+# --- Shared numerics ---------------------------------------------------------
+# Same pin as the conversion files so both environments agree on array
+# behaviour. tritonclient wants numpy>=1.19.1 and soundfile wants numpy.
+numpy==1.26.4
+# Matches NeMo 2.3.3's exact protobuf==4.24.4, and sits inside tritonclient
+# 2.51.0's protobuf<5,>=3.5.0. The upper bound of 5 is what splits these two
+# environments -- see the header.
+protobuf==4.24.4
+
+# ---------------------------------------------------------------------------
+# Removed from this file, and why
+#
+# onnxruntime-gpu==1.12.0
+#   Nothing in this repo imports onnxruntime. The only occurrence of the
+#   string is inside polygraphy's own log output during the fold step
+#   ("[W:onnxruntime:, unsqueeze_elimination.cc ...]"), and that pass needs
+#   the CPU onnxruntime package, which is already pinned as onnxruntime==1.18.1
+#   in both conversion files. Keeping a -gpu build was actively harmful:
+#   1.12.0 is a CUDA 11 wheel and will not load on a CUDA 12.4/12.6 driver,
+#   and installing it inside the container risks disturbing the CUDA/cuDNN
+#   libraries the container's TensorRT depends on.
+#
+# git+https://github.com/NVIDIA/dllogger
+#   Zero references anywhere in this repo -- no import, no mention in any
+#   notebook or script. A leftover from an old NGC container image. Safe to
+#   drop. (It was never a real requirement of this code.)
+#
+# Sanity check:
+#   python -c "import tritonclient.grpc as g; print(g.__version__)"
+#   python -c "import soundfile as sf; print(sf.__libsndfile__)"
